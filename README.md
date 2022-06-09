@@ -4,7 +4,7 @@ This repository contains the code to reproduce the datasets published on Zenodo:
 
 
 ## Generation of the datasets
-The generation of the datasets occurs in multiple steps. To reproduce the results, we reccommend using Julia 1.5.3 and use the provided Project.toml and Manifest.toml to have the same environment. The corresponding path to activate the environment has to be set in all files.
+The generation of the datasets occurs in multiple steps. To reproduce the results, we reccommend using Julia 1.5.3 and use the provided Project.toml and Manifest.toml to have the same environment. The corresponding path to activate the environment has to be set in all files. After manipulation of the paths, the scripts can be consecutively executed. Keep in mind that the dynamical computations are very expensive (~550,000 CPU hours for dataset20 and dataset100).
 
 1. Grid generation: generate_grids_and_seeds.jl
 2. Dynamical computation: compute_dynamics.jl
