@@ -15,7 +15,9 @@ Prior to executing the scripts, the paths to store/loading the grid data and sto
 ## Traning of the ML models
 To evaluate the reproducibility, we provide one Jupyter notebook and a python script to train the ArmaNet model after automatically downloading the datasets from Zenodo. We provide a conda environment file to generate a conda environment including all of the necessary software. 
 To create the conda environment, the ENVNAME can be freely chosen.
+```
 conda env create -n ENVNAME --file conda_environment.yml
+```
 
 Afterwards the script train_ArmaNet.py or train_ArmaNet.ipynb can be executed.
 
