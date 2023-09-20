@@ -10,21 +10,9 @@ import torch.optim as optim
 
 from torch_geometric.data import Data as gData
 from torch_geometric.data import Dataset as gDataset
-from torch_geometric.nn import GCNConv, ARMAConv, SAGEConv, TAGConv
+from torch_geometric.nn import GCNConv, ARMAConv, SAGEConv, TAGConv, TransformerConv
 from torch_geometric.nn import Sequential
-
-
-def get_length_of_dataset(grid_path):
-    count = 0
-    for file in sorted(os.listdir(grid_path)):
-        if file.startswith('grid_data_'):
-            if count == 0:
-                startIndex = int(os.path.splitext(
-                    file)[0].split('grid_data_')[1])
-                digits = (os.path.splitext(
-                    file)[0].split('grid_data_')[1])
-            count += 1
-    return count, startIndex, digits
+from torchmetrics import F1Score, FBetaScore, Recall, Precision, R2Score
 
 
 def convert_binary_array_to_index(binary_array):
@@ -46,84 +34,67 @@ def apply_activation(x, activation):
 
 
 class gnn_snbs_surv(gDataset):
-    def __init__(self, grid_path, task, slice_index=slice(0, 0)):
-        if slice_index.stop == 0:
-            self.data_len, self.start_index, digits = get_length_of_dataset(
-                grid_path)
-        else:
-            _, _, digits = get_length_of_dataset(grid_path)
-            self.start_index = slice_index.start + 1
-            self.data_len = slice_index.stop - slice_index.start + 1
+    def __init__(self, grid_path, task, task_type, use_dtype_double=False, slice_index=slice(0, 0), normalize_targets=False):
+        super(gnn_snbs_surv, self).__init__()
+        self.normalize_targets = normalize_targets
+        self.start_index = slice_index.start + 1
+        self.data_len = slice_index.stop - slice_index.start + 1
 
         self.path = grid_path
-        self.num_digits = '0' + str(digits.__str__().__len__())
-        self.num_classes = 1
+        # self.num_classes = 1
         self.task = task
+        self.task_type = task_type
+        if use_dtype_double == True:
+            self.dtype = 'float64'
+        else:
+            self.dtype = 'float32'
         self.data = {}
         self.read_in_all_data()
+        # self.positive_weight = self.compute_pos_weight()
+
+    def read_targets(self):
+        all_targets = {}
+        file_targets = self.path / f'{self.task}.h5'
+        hf = h5py.File(file_targets, 'r')
+        for index_grid in range(self.start_index, self.start_index + self.data_len):
+            all_targets[index_grid] = np.array(
+                hf.get(str(index_grid)), dtype=self.dtype)
+        return all_targets
 
     def read_in_all_data(self):
-        for i in range(self.start_index, self.start_index + self.data_len):
-            self.data[i] = self.__getitem_from_disk__(i)
+        targets = self.read_targets()
+        file_to_read = str(self.path) + "/input_data.h5"
+        f = h5py.File(file_to_read, 'r')
+        dset_grids = f["grids"]
+        for index_grid in range(self.start_index, self.start_index + self.data_len):
+            node_features = np.array(dset_grids[str(index_grid)].get(
+                "node_features"), dtype=self.dtype).transpose()
+            edge_index = (np.array(dset_grids[str(index_grid)].get(
+                "edge_index"), dtype='int64') - 1).transpose()
+            edge_attr = np.array(
+                dset_grids[str(index_grid)].get("edge_attr"), dtype=self.dtype)
+            y = torch.tensor(targets[index_grid])
+            self.data[index_grid - self.start_index] = gData(x=(torch.tensor(node_features).unsqueeze(-1)), edge_index=torch.tensor(
+                edge_index), edge_attr=torch.tensor(edge_attr), y=y)
 
-    def __len__(self):
-        return self.data_len
+        if self.task_type in ['classification', 'regressionThresholding']:
+            targets_all_in_one_array = targets[self.start_index]
+            for index_grid in range(self.start_index+1, self.start_index + self.data_len):
+                targets_all_in_one_array = np.concatenate(
+                    (targets_all_in_one_array, targets[index_grid]))
+            if self.task_type == "regressionThresholding":
+                targets_classified = np.where(
+                    targets_all_in_one_array < 15., 0., 1.)
+            else:
+                targets_classified = targets_all_in_one_array
+            self.positive_weight = torch.tensor((np.size(
+                targets_classified) - np.count_nonzero(targets_classified))/np.count_nonzero(targets_classified))
 
-    def num_classes(self):
-        return self.num_classes
+    def len(self):
+        return len(self.data)
 
-    def __get_input__(self, index):
-        id_index = format(index, self.num_digits)
-        file_to_read = str(self.path)+'/grid_data_'+str(id_index) + '.h5'
-        hf = h5py.File(file_to_read, 'r')
-        # read in sources/sinks
-        dataset_P = hf.get('P')
-        P = np.array(dataset_P)
-        # read in edge_index
-        dataset_edge_index = hf.get('edge_index')
-        edge_index = np.array(dataset_edge_index)-1
-        # read in edge_attr
-        dataset_edge_attr = hf.get('edge_attr')
-        edge_attr = np.array(dataset_edge_attr)
-
-        hf.close()
-        return torch.tensor(P).unsqueeze(0).transpose(0, 1), torch.tensor(edge_index).transpose(1, 0), torch.tensor(edge_attr)
-
-    def __get_P__(self, index):
-        P, _, _ = self.__get_input__(index)
-        return P
-
-    def __get_edge_index__(self, index):
-        _, edge_index, _ = self.__get_input__(index)
-        return edge_index
-
-    def __get_edge_attr__(self, index):
-        _, _, edge_attr = self.__get_input__(index)
-        return edge_attr
-
-    def __get_label__(self, index):
-        id_index = format(index, self.num_digits)
-        if self.task == "snbs":
-            file_to_read = str(self.path)+'/snbs_'+str(id_index) + '.h5'
-        elif self.task == "surv":
-            file_to_read = str(self.path)+'/surv_'+str(id_index) + '.h5'
-        hf = h5py.File(file_to_read, 'r')
-        if self.task == "snbs":
-            dataset_target = hf.get('snbs')
-        elif self.task == "surv":
-            dataset_target = hf.get('surv')
-        targets = np.array(dataset_target)
-        hf.close()
-        return torch.tensor(targets).unsqueeze(1)
-
-    def __getitem_from_disk__(self, index):
-        x, edge_index, edge_attr = self.__get_input__(index)
-        y = self.__get_label__(index)
-        data = gData(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
-        return data
-
-    def __getitem__(self, index):
-        return self.data[index+self.start_index]
+    def get(self, index):
+        return self.data[index]
 
 
 class ArmaConvModule(torch.nn.Module):
@@ -206,8 +177,30 @@ class TAGConvModule(torch.nn.Module):
         return x
 
 
+class TransformConvModule(torch.nn.Module):
+    def __init__(self, num_channels_in, num_channels_out, activation, heads, dropout, batch_norm=False):
+        super(TransformConvModule, self).__init__()
+        self.activation = activation
+        self.batch_norm = batch_norm
+        # self.conv = TransformerConv(num_channels_in, num_channels_out, edge_dim=0, dropout=.1)
+        self.conv = TransformerConv(
+            num_channels_in, num_channels_out, heads=heads, dropout=dropout)
+        if batch_norm:
+            self.batch_norm_layer = nn.BatchNorm1d(num_channels_out)
+
+    def forward(self, data, x):
+        edge_index, edge_weight = data.edge_index, data.edge_attr
+        # x = self.conv(x, edge_index=edge_index,
+        #               edge_attr=edge_weight.float())
+        x = self.conv(x, edge_index=edge_index)
+        if self.batch_norm:
+            x = self.batch_norm_layer(x)
+        x = apply_activation(x, self.activation)
+        return x
+
+
 class ArmaNet_bench(torch.nn.Module):
-    def __init__(self, num_classes=1, num_node_features=1, num_layers=4, num_stacks=3):
+    def __init__(self, num_classes=1, num_node_features=1, num_layers=4, num_stacks=3, final_sigmoid_layer=True):
         super(ArmaNet_bench, self).__init__()
         self.conv1 = ARMAConv(num_node_features, 16, num_stacks=num_stacks,
                               num_layers=num_layers, shared_weights=True, dropout=0.25)
@@ -216,7 +209,9 @@ class ArmaNet_bench(torch.nn.Module):
                               num_layers=num_layers, shared_weights=True, dropout=0.25, act=None)
         self.conv2_bn = nn.BatchNorm1d(num_classes)
         self.endLinear = nn.Linear(num_classes, num_classes)
-        self.endSigmoid = nn.Sigmoid()
+        self.final_sigmoid_layer = final_sigmoid_layer
+        if final_sigmoid_layer == True:
+            self.endSigmoid = nn.Sigmoid()
 
     def forward(self, data):
         x, edge_index, edge_weight = data.x, data.edge_index, data.edge_attr
@@ -228,7 +223,8 @@ class ArmaNet_bench(torch.nn.Module):
         x = self.conv2(x, edge_index=edge_index,
                        edge_weight=edge_weight.float())
         # x = self.endLinear(x)
-        x = self.endSigmoid(x)
+        if self.final_sigmoid_layer == True:
+            x = self.endSigmoid(x)
         return x
 
     def reset_parameters(self):
@@ -238,10 +234,11 @@ class ArmaNet_bench(torch.nn.Module):
 
 
 class ArmaNet_ray(torch.nn.Module):
-    def __init__(self, num_layers, num_channels, activation, num_internal_layers, num_internal_stacks, batch_norm_index, shared_weights, dropout, final_linear_layer):
+    def __init__(self, num_layers, num_channels, activation, num_internal_layers, num_internal_stacks, batch_norm_index, shared_weights, dropout, final_linear_layer, final_sigmoid_layer=True):
         super(ArmaNet_ray, self).__init__()
         self.batch_norm_index = convert_binary_array_to_index(batch_norm_index)
         self.final_linear_layer = final_linear_layer
+        self.final_sigmoid_layer = final_sigmoid_layer
 
         self.convlist = nn.ModuleList()
         for i in range(0, num_layers):
@@ -254,7 +251,8 @@ class ArmaNet_ray(torch.nn.Module):
             self.convlist.append(conv)
         if final_linear_layer:
             self.endLinear = nn.Linear(1, 1)
-        self.endSigmoid = nn.Sigmoid()
+        if final_sigmoid_layer == True:
+            self.endSigmoid = nn.Sigmoid()
 
     def forward(self, data):
         x = data.x
@@ -262,7 +260,8 @@ class ArmaNet_ray(torch.nn.Module):
             x = self.convlist[i](data, x)
         if self.final_linear_layer:
             x = self.endLinear(x)
-        x = self.endSigmoid(x)
+        if self.final_sigmoid_layer == True:
+            x = self.endSigmoid(x)
         return x
 
 
@@ -306,11 +305,12 @@ class GCNNet_bench(torch.nn.Module):
 
 
 class GCNNet_ray(torch.nn.Module):
-    def __init__(self, num_layers, num_channels, activation, improved, batch_norm_index, final_linear_layer):
+    def __init__(self, num_layers, num_channels, activation, improved, batch_norm_index, final_linear_layer, final_sigmoid_layer=True):
         super(GCNNet_ray, self).__init__()
 
         self.batch_norm_index = convert_binary_array_to_index(batch_norm_index)
         self.final_linear_layer = final_linear_layer
+        self.final_sigmoid_layer = final_sigmoid_layer
 
         self.convlist = nn.ModuleList()
         for i in range(0, num_layers):
@@ -321,7 +321,8 @@ class GCNNet_ray(torch.nn.Module):
             self.convlist.append(conv)
         if final_linear_layer:
             self.endLinear = nn.Linear(1, 1)
-        self.endSigmoid = nn.Sigmoid()
+        if final_sigmoid_layer == True:
+            self.endSigmoid = nn.Sigmoid()
 
     def forward(self, data):
         x = data.x
@@ -329,15 +330,17 @@ class GCNNet_ray(torch.nn.Module):
             x = self.convlist[i](data, x)
         if self.final_linear_layer:
             x = self.endLinear(x)
-        x = self.endSigmoid(x)
+        if self.final_sigmoid_layer == True:
+            x = self.endSigmoid(x)
         return x
 
 
 class SAGENet_ray(torch.nn.Module):
-    def __init__(self, num_layers, num_channels, activation, batch_norm_index, final_linear_layer):
+    def __init__(self, num_layers, num_channels, activation, batch_norm_index, final_linear_layer, final_sigmoid_layer=True):
         super(SAGENet_ray, self).__init__()
         self.activation = activation
         self.final_linear_layer = final_linear_layer
+        self.final_sigmoid_layer = final_sigmoid_layer
 
         self.convlist = nn.ModuleList()
         for i in range(0, num_layers):
@@ -348,7 +351,8 @@ class SAGENet_ray(torch.nn.Module):
             self.convlist.append(conv)
         if final_linear_layer:
             self.endLinear = nn.Linear(1, 1)
-        self.endSigmoid = nn.Sigmoid()
+        if final_sigmoid_layer == True:
+            self.endSigmoid = nn.Sigmoid()
 
     def forward(self, data):
         x = data.x
@@ -356,7 +360,8 @@ class SAGENet_ray(torch.nn.Module):
             x = self.convlist[i](data, x)
         if self.final_linear_layer:
             x = self.endLinear(x)
-        x = self.endSigmoid(x)
+        if self.final_sigmoid_layer == True:
+            x = self.endSigmoid(x)
         return x
 
 
@@ -387,11 +392,12 @@ class TAGNet_bench(torch.nn.Module):
 
 
 class TAGNet_ray(torch.nn.Module):
-    def __init__(self, num_layers, num_channels, activation, K_hops, batch_norm_index, final_linear_layer):
+    def __init__(self, num_layers, num_channels, activation, K_hops, batch_norm_index, final_linear_layer, final_sigmoid_layer=True):
         super(TAGNet_ray, self).__init__()
 
         self.batch_norm_index = convert_binary_array_to_index(batch_norm_index)
         self.final_linear_layer = final_linear_layer
+        self.final_sigmoid_layer = final_sigmoid_layer
 
         self.convlist = nn.ModuleList()
         for i in range(0, num_layers):
@@ -404,7 +410,8 @@ class TAGNet_ray(torch.nn.Module):
             self.convlist.append(conv)
         if final_linear_layer:
             self.endLinear = nn.Linear(1, 1)
-        self.endSigmoid = nn.Sigmoid()
+        if final_sigmoid_layer == True:
+            self.endSigmoid = nn.Sigmoid()
 
     def forward(self, data):
         x = data.x
@@ -412,14 +419,50 @@ class TAGNet_ray(torch.nn.Module):
             x = self.convlist[i](data, x)
         if self.final_linear_layer:
             x = self.endLinear(x)
-        x = self.endSigmoid(x)
+        if self.final_sigmoid_layer == True:
+            x = self.endSigmoid(x)
+        return x
+
+
+class TransformerNet_ray(torch.nn.Module):
+    def __init__(self, num_layers, num_channels, activation, batch_norm_index, heads, dropout, final_linear_layer, final_sigmoid_layer=True):
+        super(TransformerNet_ray, self).__init__()
+
+        self.batch_norm_index = convert_binary_array_to_index(batch_norm_index)
+        self.final_linear_layer = final_linear_layer
+        self.final_sigmoid_layer = final_sigmoid_layer
+
+        self.convlist = nn.ModuleList()
+        for i in range(0, num_layers):
+            num_c_in = num_channels[i]
+            if i > 0:
+                num_c_in = num_c_in * heads
+            num_c_out = num_channels[i+1]
+            conv = TransformConvModule(
+                num_channels_in=num_c_in, num_channels_out=num_c_out, activation=activation[i], heads=heads, dropout=dropout, batch_norm=batch_norm_index[i])
+            self.convlist.append(conv)
+        if final_linear_layer:
+            self.endLinear = nn.Linear(num_c_out*heads, 1)
+        if final_sigmoid_layer == True:
+            self.endSigmoid = nn.Sigmoid()
+
+    def forward(self, data):
+        x = data.x
+        for i, _ in enumerate(self.convlist):
+            x = self.convlist[i](data, x)
+        if self.final_linear_layer:
+            x = self.endLinear(x)
+        if self.final_sigmoid_layer == True:
+            x = self.endSigmoid(x)
         return x
 
 
 class GNNmodule(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, criterion_positive_weight=False):
         super(GNNmodule, self).__init__()
         cuda = config["cuda"]
+        if "Fbeta::beta" in config:
+            self.beta = config["Fbeta::beta"]
         if cuda and torch.cuda.is_available():
             self.device = torch.device("cuda:0")
             self.cuda = True
@@ -428,6 +471,10 @@ class GNNmodule(nn.Module):
             self.cuda = False
             self.device = torch.device("cpu")
             print("cuda unavailable:: train model on cpu")
+        self.critierion_positive_weight = criterion_positive_weight
+        if type(self.critierion_positive_weight) != bool:
+            self.critierion_positive_weight = torch.tensor(
+                self.critierion_positive_weight).to(self.device)
 
         # seeds
         torch.manual_seed(config["manual_seed"])
@@ -440,39 +487,68 @@ class GNNmodule(nn.Module):
         # num_channels
         if config["model_name"] != "ArmaNet_bench":
             num_channels = self.make_list_number_of_channels(config)
-
+        task_type = config["task_type"]
+        if "final_sigmoid_layer" in config:
+            final_sigmoid_layer = config["final_sigmoid_layer"]
+        else:
+            if task_type == "classification":
+                final_sigmoid_layer = False
+                print("information to final sigmoid layer missing, setting it to False")
+            if task_type == "regression":
+                final_sigmoid_layer = True
+                print("information to final sigmoid layer missing, setting it to True")
+            else:
+                final_sigmoid_layer = True
+                print("information to final sigmoid layer missing, setting it to True")
         if config["model_name"] == "ArmaNet_bench":
-            model = ArmaNet_bench()
+            model = ArmaNet_bench(
+                final_sigmoid_layer=final_sigmoid_layer)
         elif config["model_name"] == "ArmaNet_ray":
             num_internal_layers = self.make_list_Arma_internal_layers(config)
             num_internal_stacks = self.make_list_Arma_internal_stacks(config)
             model = ArmaNet_ray(num_layers=config["num_layers"], num_channels=num_channels, activation=config["activation"],
-                                num_internal_layers=num_internal_layers, num_internal_stacks=num_internal_stacks, batch_norm_index=config["batch_norm_index"], shared_weights=config["ARMA::shared_weights"], dropout=config["ARMA::dropout"], final_linear_layer=config["final_linear_layer"])
+                                num_internal_layers=num_internal_layers, num_internal_stacks=num_internal_stacks, batch_norm_index=config["batch_norm_index"], shared_weights=config["ARMA::shared_weights"], dropout=config["ARMA::dropout"], final_linear_layer=config["final_linear_layer"], final_sigmoid_layer=final_sigmoid_layer)
         elif config["model_name"] == "GCNNet_bench":
             model = GCNNet_bench()
         elif config["model_name"] == "GCNNet_ray":
             model = GCNNet_ray(num_layers=config["num_layers"], num_channels=num_channels, activation=config["activation"], improved=config["GCN::improved"],
-                               batch_norm_index=config["batch_norm_index"], final_linear_layer=config["final_linear_layer"])
+                               batch_norm_index=config["batch_norm_index"], final_linear_layer=config["final_linear_layer"], final_sigmoid_layer=final_sigmoid_layer)
         elif config["model_name"] == "SAGENet_ray":
             model = SAGENet_ray(num_layers=config["num_layers"], num_channels=num_channels, activation=config["activation"],
-                                batch_norm_index=config["batch_norm_index"], final_linear_layer=config["final_linear_layer"])
+                                batch_norm_index=config["batch_norm_index"], final_linear_layer=config["final_linear_layer"], final_sigmoid_layer=final_sigmoid_layer)
         elif config["model_name"] == "TAGNet_bench":
             model = TAGNet_bench()
         elif config["model_name"] == "TAGNet_ray":
             K_hops = self.make_list_Tag_hops(config)
             model = TAGNet_ray(num_layers=config["num_layers"], num_channels=num_channels, activation=config["activation"], K_hops=K_hops,
-                               batch_norm_index=config["batch_norm_index"], final_linear_layer=config["final_linear_layer"])
+                               batch_norm_index=config["batch_norm_index"], final_linear_layer=config["final_linear_layer"], final_sigmoid_layer=final_sigmoid_layer)
+        elif config["model_name"] == "TransformerNet_ray":
+            model = TransformerNet_ray(num_layers=config["num_layers"], num_channels=num_channels, activation=config["activation"], batch_norm_index=config["batch_norm_index"],
+                                       heads=config["Transformer::heads"], dropout=config["Transformer::dropout"], final_linear_layer=config["final_linear_layer"], final_sigmoid_layer=final_sigmoid_layer)
         else:
             print("error: model type unkown")
 
-        model.double()
+        # model.double()
         model.to(self.device)
 
         self.model = model
 
         # criterion
         if config["criterion"] == "MSELoss":
-            self.criterion = nn.MSELoss()
+            if criterion_positive_weight == True:
+                self.criterion = nn.MSELoss(reduction="none")
+            else:
+                self.criterion = nn.MSELoss()
+        if config["criterion"] == "BCEWithLogitsLoss":
+            if criterion_positive_weight == False:
+                self.criterion = nn.BCEWithLogitsLoss()
+            else:
+                self.criterion = nn.BCEWithLogitsLoss(
+                    pos_weight=torch.tensor(criterion_positive_weight))
+                print("positive_weigt used for criterion: ",
+                      criterion_positive_weight)
+        if config["criterion"] == "BCELoss":
+            self.criterion = nn.BCELoss()
         self.criterion.to(self.device)
 
         # set opimizer
@@ -483,7 +559,6 @@ class GNNmodule(nn.Module):
             optimizer = optim.Adam(model.parameters(
             ), lr=config["optim::LR"], weight_decay=config["optim::weight_decay"])
         self.optimizer = optimizer
-        # self.optimizer.to(self.device)
 
         # scheduler
         scheduler_name = config["optim::scheduler"]
@@ -502,10 +577,6 @@ class GNNmodule(nn.Module):
         elif scheduler_name == None:
             scheduler = None
         self.scheduler = scheduler
-
-        # self.epoch = 0
-        # self.best_epoch = 0
-        # self.loss_best = 1e15
 
     def forward(self, x):
         # compute model prediction
@@ -529,78 +600,219 @@ class GNNmodule(nn.Module):
         if scheduler_name == "ExponentialLR":
             self.scheduler.step()
 
-    def train_epoch(self, data_loader, threshold):
+    def train_epoch_regression(self, data_loader, threshold):
         self.model.train()
-        # scheduler = self.scheduler
-        N = data_loader.dataset[0].x.shape[0]
         loss = 0.
         correct = 0
         mse_trained = 0.
         all_labels = torch.Tensor(0).to(self.device)
-        for iter, (batch) in enumerate(data_loader):
+        all_predictions = torch.Tensor(0).to(self.device)
+        for _, (batch) in enumerate(data_loader):
             batch.to(self.device)
             self.optimizer.zero_grad()
-            output = self.model.forward(batch)
+            output = torch.squeeze(self.model.forward(batch))
             labels = batch.y
             temp_loss = self.criterion(output, labels)
             temp_loss.backward()
             self.optimizer.step()
-            correct += self.get_prediction(output, labels, threshold)
+            correct += torch.sum((torch.abs(output - labels) < threshold))
             loss += temp_loss.item()
-            # R2
-            mse_trained += torch.sum((output - labels) ** 2)
             all_labels = torch.cat([all_labels, labels])
-        # self.epoch += 1
-        # R2
-        mean_labels = torch.mean(all_labels)
-        array_ones = torch.ones(all_labels.shape[0], 1)
-        array_ones = array_ones.to(self.device)
-        output_mean = mean_labels * array_ones
-        mse_mean = torch.sum((output_mean-all_labels)**2)
-        R2 = (1 - mse_trained/mse_mean).item()
-        # R2 = 1 - mse_trained/mse_mean
+            all_predictions = torch.cat([all_predictions, output])
+        r2score = R2Score().to(self.device)
+        R2 = r2score(all_predictions, all_labels)
         # accuracy
         accuracy = 100 * correct / all_labels.shape[0]
         self.scheduler_step(loss)
-        return loss, accuracy, R2
+        return loss, accuracy.item(), R2.item()
 
-    def eval_model(self, data_loader, threshold):
+    def train_epoch_regressionThresholding(self, data_loader):
+        if self.critierion_positive_weight == False:
+            return self.train_epoch_regressionThresholdingMSE(data_loader)
+        else:
+            return self.train_epoch_regressionThresholdingWeighted(data_loader)
+
+    def train_epoch_regressionThresholdingWeighted(self, data_loader):
+        self.model.train()
+        loss = 0.
+        mse_trained = 0.
+        all_labels = torch.Tensor(0).to(self.device)
+        all_outputs = torch.Tensor(0).to(self.device)
+        for iter, (batch) in enumerate(data_loader):
+            batch.to(self.device)
+            self.optimizer.zero_grad()
+            output = self.model.forward(batch).squeeze()
+            labels = batch.y
+            temp_loss = self.criterion(output, labels)
+            labels_class = torch.where(labels < 15., torch.tensor(0.).to(
+                self.device), torch.tensor(1.).to(self.device)).int().to(self.device)
+            weights = torch.where(labels_class == torch.tensor(
+                1), self.critierion_positive_weight, torch.tensor(1.).to(self.device))
+            temp_loss = temp_loss * weights
+            temp_loss = temp_loss.mean()
+            temp_loss.backward()
+            self.optimizer.step()
+            loss += temp_loss.item()
+            all_labels = torch.cat([all_labels, labels])
+            all_outputs = torch.cat([all_outputs, output])
+
+        r2score = R2Score().to(self.device)
+        R2 = r2score(all_outputs, all_labels)
+
+        labels_classification = torch.where(all_labels < 15., 0., 1.).int()
+        outputs_classification = torch.where(all_outputs < 15., 0., 1.).int()
+        fbeta = FBetaScore(multiclass=False, beta=self.beta).to(self.device)
+        fbeta = fbeta(outputs_classification, labels_classification)
+        recall = Recall(multiclass=False)
+        recall = recall.to(self.device)
+        recall = recall(outputs_classification, labels_classification)
+        self.scheduler_step(loss)
+        return loss, R2.item(), fbeta.item(), recall.item()
+
+    def train_epoch_regressionThresholdingMSE(self, data_loader):
+        self.model.train()
+        loss = 0.
+        mse_trained = 0.
+        all_labels = torch.Tensor(0).to(self.device)
+        all_outputs = torch.Tensor(0).to(self.device)
+        for iter, (batch) in enumerate(data_loader):
+            batch.to(self.device)
+            self.optimizer.zero_grad()
+            output = self.model.forward(batch).squeeze()
+            labels = batch.y
+            temp_loss = self.criterion(output, labels)
+            temp_loss.backward()
+            self.optimizer.step()
+            loss += temp_loss.item()
+            all_labels = torch.cat([all_labels, labels])
+            all_outputs = torch.cat([all_outputs, output])
+
+        r2score = R2Score().to(self.device)
+        R2 = r2score(all_outputs, all_labels)
+
+        labels_classification = torch.where(all_labels < 15., 0., 1.).int()
+        outputs_classification = torch.where(all_outputs < 15., 0., 1.).int()
+        fbeta = FBetaScore(multiclass=False, beta=self.beta).to(self.device)
+        fbeta = fbeta(outputs_classification, labels_classification)
+        recall = Recall(multiclass=False)
+        recall = recall.to(self.device)
+        recall = recall(outputs_classification, labels_classification)
+        self.scheduler_step(loss)
+        return loss, R2.item(), fbeta.item(), recall.item()
+
+    def train_epoch_classification(self, data_loader):
+        self.model.train()
+        loss = 0.
+        correct = 0
+        all_labels = torch.Tensor(0).to(self.device)
+        all_outputs = torch.Tensor(0).to(self.device)
+        for _, (batch) in enumerate(data_loader):
+            batch.to(self.device)
+            self.optimizer.zero_grad()
+            output = self.model.forward(batch).squeeze()
+            labels = batch.y
+            temp_loss = self.criterion(output, labels)
+            temp_loss.backward()
+            self.optimizer.step()
+            loss += temp_loss.item()
+            all_labels = torch.cat([all_labels, labels])
+            all_outputs = torch.cat([all_outputs, output])
+        sigmoid_layer = torch.nn.Sigmoid().to(self.device)
+        all_outputs_bin = sigmoid_layer(all_outputs) > .5
+        correct += (all_outputs_bin == all_labels).sum()
+        f1 = F1Score(multiclass=False).to(self.device)
+        f1 = f1(all_outputs_bin, all_labels.int())
+        fbeta = FBetaScore(multiclass=False, beta=self.beta).to(self.device)
+        fbeta = fbeta(all_outputs_bin, all_labels.int())
+        accuracy = 100 * correct / all_labels.shape[0]
+        recall = Recall(multiclass=False)
+        recall = recall.to(self.device)
+        recall = recall(all_outputs_bin, all_labels.int())
+        precision = Precision(multiclass=False)
+        precision = precision.to(self.device)
+        precision = precision(all_outputs_bin, all_labels.int())
+        self.scheduler_step(loss)
+        return loss, accuracy.item(), f1.item(), fbeta.item(), recall.item(), precision.item()
+
+    def eval_model_regression(self, data_loader, threshold):
         self.model.eval()
         with torch.no_grad():
-            N = data_loader.dataset[0].x.shape[0]
             loss = 0.
             correct = 0
             mse_trained = 0.
             all_labels = torch.Tensor(0).to(self.device)
+            all_predictions = torch.Tensor(0).to(self.device)
             for batch in data_loader:
                 batch.to(self.device)
                 labels = batch.y
-                output = self.model(batch)
+                output = torch.squeeze(self.model(batch))
                 temp_loss = self.criterion(output, labels)
                 loss += temp_loss.item()
-                correct += self.get_prediction(output, labels, threshold)
-                # R2
-                mse_trained += torch.sum((output - labels) ** 2)
+                correct += torch.sum((torch.abs(output - labels) < threshold))
+                all_predictions = torch.cat([all_predictions, output])
                 all_labels = torch.cat([all_labels, labels])
             accuracy = 100 * correct / all_labels.shape[0]
-        # R2
-        mean_labels = torch.mean(all_labels)
-        array_ones = torch.ones(all_labels.shape[0], 1)
-        array_ones = array_ones.to(self.device)
-        output_mean = mean_labels * array_ones
-        mse_mean = torch.sum((output_mean-all_labels)**2)
-        R2 = (1 - mse_trained/mse_mean).item()
-        return loss, accuracy, R2
+        r2score = R2Score().to(self.device)
+        R2 = r2score(all_predictions, all_labels)
+        return loss, accuracy.item(), R2.item()
 
-    def get_prediction(self, output, label, tol):
-        count = 0
-        output = output.view(-1, 1).view(-1)
-        label = label.view(-1, 1).view(-1)
-        batchSize = output.size(-1)
-        for i in range(batchSize):
-            if ((abs(output[i] - label[i]) < tol).item() == True):
-                count += 1
-        return count
+    def eval_model_regressionThresholding(self, data_loader):
+        self.model.eval()
+        with torch.no_grad():
+            loss = 0.
+            mse_trained = 0.
+            all_labels = torch.Tensor(0).to(self.device)
+            all_outputs = torch.Tensor(0).to(self.device)
+            for batch in data_loader:
+                batch.to(self.device)
+                labels = batch.y
+                output = self.model(batch).squeeze()
+                temp_loss = self.criterion(output, labels)
+                loss += temp_loss.item()
+                all_labels = torch.cat([all_labels, labels])
+                all_outputs = torch.cat([all_outputs, output])
+        r2score = R2Score().to(self.device)
+        R2 = r2score(all_outputs, all_labels)
+
+        labels_classification = torch.where(all_labels < 15., 0., 1.).int()
+        outputs_classification = torch.where(all_outputs < 15., 0., 1.).int()
+        fbeta = FBetaScore(multiclass=False, beta=self.beta).to(self.device)
+        fbeta = fbeta(outputs_classification, labels_classification)
+        recall = Recall(multiclass=False)
+        recall = recall.to(self.device)
+        recall = recall(outputs_classification, labels_classification)
+        return loss, R2.item(), fbeta.item(), recall.item()
+
+    def eval_model_classification(self, data_loader):
+        self.model.eval()
+        with torch.no_grad():
+            loss = 0.
+            correct = 0
+            all_labels = torch.Tensor(0).to(self.device)
+            all_outputs = torch.Tensor(0).to(self.device)
+            for batch in data_loader:
+                batch.to(self.device)
+                labels = batch.y
+                output = self.model(batch).squeeze()
+                temp_loss = self.criterion(output, labels)
+                loss += temp_loss.item()
+                all_labels = torch.cat([all_labels, labels])
+                all_outputs = torch.cat([all_outputs, output])
+        sigmoid_layer = torch.nn.Sigmoid().to(self.device)
+        all_outputs_bin = sigmoid_layer(all_outputs) > .5
+        correct += (all_outputs_bin == all_labels).sum()
+        f1 = F1Score(multiclass=False).to(self.device)
+        f1 = f1(all_outputs_bin, all_labels.int())
+        fbeta = FBetaScore(multiclass=False, beta=self.beta).to(self.device)
+        fbeta = fbeta(all_outputs_bin, all_labels.int())
+        accuracy = 100 * correct / all_labels.shape[0]
+        recall = Recall(multiclass=False)
+        recall = recall.to(self.device)
+        recall = recall(all_outputs_bin, all_labels.int())
+        precision = Precision(multiclass=False)
+        precision = precision.to(self.device)
+        precision = precision(all_outputs_bin, all_labels.int())
+        return loss, accuracy.item(), f1.item(), fbeta.item(), recall.item(), precision.item()
 
     def aggregate_list_from_config(self, config, key_word, index_start, index_end):
         new_list = [config[key_word+str(index_start)]]
@@ -640,3 +852,7 @@ class GNNmodule(nn.Module):
         list_internal_layers = self.aggregate_list_from_config(
             config, key_word, index_start, index_end)
         return list_internal_layers
+
+
+def weighted_mse_loss(input, target, weight):
+    return (weight * (input - target) ** 2).sum() / weight.sum()
